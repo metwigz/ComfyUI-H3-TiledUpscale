@@ -6,6 +6,7 @@
 
 **Latent Tiled Video Super-Resolution for MiniMax H3 (Hailuo-01 / Ref2VA).**  
 A ComfyUI Minimax H3 custom node to re-sample an existing video/latent in tiles in order to output larger resolutions.
+
 Upscale video latents of **any input resolution** (e.g. 512p, 720p, 1080p) to **1080p (2.07 MP)**, **2K QHD (3.69 MP)**, **4K UHD (8.29 MP)**, and **8K UHD (33.18 MP)** directly in latent space while strictly preserving synchronized audio.
 
 ---
