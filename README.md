@@ -169,7 +169,7 @@ High-performance video and audio multiplexer with in-flight VAE streaming decode
 
 ## Reference Workflow
 
-A complete ready-to-run 4K upscale workflow is provided in the repository:
+A 2K upscale workflow is provided in the repository:
 - [`examples/h3_tiled_upscale_example_01.json`](examples/h3_tiled_upscale_example_01.json)
 
 Drag and drop this JSON file directly into ComfyUI to load the full 6-node standard pipeline.
