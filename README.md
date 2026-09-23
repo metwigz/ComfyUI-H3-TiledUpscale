@@ -50,17 +50,13 @@ flowchart LR
 
 ## Installation
 
-### Method 1: ComfyUI-Manager (Recommended)
-Search for `ComfyUI-H3-TiledUpscale` in ComfyUI-Manager and click **Install**.
-
-### Method 2: Manual Git Clone
 1. Navigate to your ComfyUI `custom_nodes` directory:
    ```bash
    cd ComfyUI/custom_nodes
    ```
 2. Clone this repository:
    ```bash
-   git clone https://github.com/comfyanonymous/ComfyUI-H3-TiledUpscale.git
+   git clone https://github.com/metwigz/ComfyUI-H3-TiledUpscale.git
    ```
 3. Install dependencies:
    ```bash
