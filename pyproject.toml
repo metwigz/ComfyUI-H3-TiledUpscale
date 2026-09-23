@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-h3-tiledupscale"
+description = "Native 5D Latent Tiled Video Super-Resolution for MiniMax H3 (Hailuo-01 / Ref2VA) under 16GB-24GB VRAM in ComfyUI."
+version = "1.0.0"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+keywords = [
+    "comfyui",
+    "minimax",
+    "minimax-h3",
+    "video-upscale",
+    "tiled-diffusion",
+    "super-resolution",
+    "latent-upscaler",
+    "ref2va"
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "opencv-python-headless>=4.8.0",
+    "einops>=0.7.0",
+    "imageio-ffmpeg>=0.4.9",
+    "ultralytics>=8.1.0",
+    "transformers>=4.40.0",
+    "huggingface-hub>=0.20.0",
+    "safetensors>=0.4.0",
+    "tqdm>=4.65.0",
+    "Pillow>=9.5.0",
+]
+
+[tool.comfy]
+PublisherId = "comfyui-community"
+DisplayName = "ComfyUI-H3-TiledUpscale"
+Icon = ""
+includes = []
