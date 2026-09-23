@@ -1,4 +1,4 @@
-# ComfyUI-H3-TiledUpscale
+# ComfyUI-H3-TiledUpscale - THIS IS A VERY WIP PROJECT
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
