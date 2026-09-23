@@ -22,6 +22,12 @@ Upscale video latents of **any input resolution** (e.g. 512p, 720p, 1080p) to **
 
 ---
 
+## Example Workflow
+
+![ComfyUI-H3-TiledUpscale Example Workflow](examples/picture_h3_tiled_upscale_example_01.jpg)
+
+---
+
 ## End-to-End Pipeline Architecture
 
 ```mermaid
