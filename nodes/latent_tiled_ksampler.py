@@ -132,6 +132,10 @@ class H3LatentTiledKSampler:
                     "default": False,
                     "tooltip": "Minimizes tile dimensions to satisfy overlap_percent without redundant overlap inflation while strictly preserving canvas aspect ratio."
                 }),
+                "min_tile_megapixels": ("FLOAT", {
+                    "default": 0.25, "min": 0.05, "max": 2.0, "step": 0.01, "round": 0.01,
+                    "tooltip": "Semantic safety floor below which tiles will not shrink when tight_tile_overlap is enabled."
+                }),
                 "spatial_blend_mode": (["Multiscale_Laplacian", "Wavelet_Frequency_Decouple", "Linear_Feather"], {
                     "default": "Multiscale_Laplacian",
                     "tooltip": "Tile blending algorithm: 'Multiscale_Laplacian' (seamless frequency decomposition, recommended), 'Wavelet_Frequency_Decouple', or 'Linear_Feather'."
@@ -226,6 +230,7 @@ class H3LatentTiledKSampler:
         tile_megapixels=0.92,
         overlap_percent=0.25,
         tight_tile_overlap=False,
+        min_tile_megapixels=0.25,
         spatial_blend_mode="Multiscale_Laplacian",
         temporal_chunk_frames=124,
         temporal_blend_frames=17,
@@ -272,7 +277,9 @@ class H3LatentTiledKSampler:
 
         # 1. Compute Spatial Grid Intervals & Temporal Chunks (respecting aspect ratio & tight overlap)
         tile_w, tile_h, _, _ = calculate_optimal_tile_dimensions(
-            target_w, target_h, tile_megapixels, overlap_percent, tight_tile_overlap=tight_tile_overlap
+            target_w, target_h, tile_megapixels, overlap_percent,
+            tight_tile_overlap=tight_tile_overlap,
+            min_megapixels=min_tile_megapixels
         )
         x_intervals = compute_tile_intervals(target_w, tile_w, overlap_percent)
         y_intervals = compute_tile_intervals(target_h, tile_h, overlap_percent)
