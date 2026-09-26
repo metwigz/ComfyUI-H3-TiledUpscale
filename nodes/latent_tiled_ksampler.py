@@ -22,7 +22,9 @@ except ImportError:
 from ..core.grid_utils import (
     compute_tile_intervals,
     compute_temporal_chunks,
-    calculate_optimal_tile_dimensions
+    calculate_optimal_tile_dimensions,
+    minimax_latents_to_frames,
+    minimax_frames_to_latents
 )
 from ..core.laplacian_pyramid import generate_hann_weight_2d
 from ..core.prompt_utils import (
@@ -172,8 +174,8 @@ class H3LatentTiledKSampler:
                 "vae": ("VAE", {"tooltip": "Video VAE for keyframe anchor propagation and debug chunk decoding"}),
                 "audio_vae": ("VAE", {"tooltip": "Audio VAE to decode and multiplex audio into debug chunk videos"}),
                 "propagate_keyframes": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Carries boundary keyframe latents forward between chunks as conditioning anchors for strict temporal continuity."
+                    "default": False,
+                    "tooltip": "Carries boundary keyframe latents forward between chunks as conditioning anchors for strict temporal continuity (recommended False for latent upscaling)."
                 }),
                 "color_lock_to_base": ("BOOLEAN", {
                     "default": False,
@@ -197,6 +199,14 @@ class H3LatentTiledKSampler:
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "tooltip": "Random seed for spatially coherent canvas noise across all tiles and chunks. Overlapping tile regions share identical noise, eliminating motion seam artifacts."
+                }),
+                "fps": ("FLOAT", {
+                    "default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0,
+                    "tooltip": "Video frame rate (e.g. 24.0, 72.0) used to accurately slice and synchronize audio latent tokens with video chunks."
+                }),
+                "tile_audio_mode": (["mute_during_upscale", "active_audio"], {
+                    "default": "mute_during_upscale",
+                    "tooltip": "In tiled upscaling, isolated face crops cannot see off-screen characters. Setting to 'mute_during_upscale' passes neutral silence into the DiT during tile diffusion, preventing the model from hallucinating mouth movement on the wrong character for off-camera dialogue while preserving the input video's existing lips and high-frequency textures. The full synchronized soundtrack is still output cleanly at the end."
                 }),
             }
         }
@@ -228,13 +238,15 @@ class H3LatentTiledKSampler:
         clip=None,
         vae=None,
         audio_vae=None,
-        propagate_keyframes=True,
+        propagate_keyframes=False,
         color_lock_to_base=False,
         enable_intersection_center_patches=False,
         offload_device="cpu",
         positive=None,
         precache_tile_conditioning=True,
         seed=0,
+        fps=24.0,
+        tile_audio_mode="mute_during_upscale",
         **kwargs
     ):
         if latent_image is None:
@@ -246,7 +258,14 @@ class H3LatentTiledKSampler:
 
         B, C, T_lat, H_lat, W_lat = canvas_latent.shape
         target_w, target_h = W_lat * 16, H_lat * 16
-        total_frames = (T_lat - 1) * 4 + 1 if T_lat > 1 else 1
+        total_frames = minimax_latents_to_frames(T_lat)
+
+        fps_val = float(fps) if (fps is not None and fps > 0) else 24.0
+        if isinstance(latent_image, dict) and "fps" in latent_image:
+            try:
+                fps_val = float(latent_image["fps"])
+            except Exception:
+                pass
 
         temporal_chunk_frames = int(temporal_chunk_frames) if temporal_chunk_frames is not None else 124
         temporal_blend_frames = int(temporal_blend_frames) if temporal_blend_frames is not None else 17
@@ -257,7 +276,26 @@ class H3LatentTiledKSampler:
         )
         x_intervals = compute_tile_intervals(target_w, tile_w, overlap_percent)
         y_intervals = compute_tile_intervals(target_h, tile_h, overlap_percent)
-        temporal_chunks = compute_temporal_chunks(total_frames, temporal_chunk_frames, blend_frames=temporal_blend_frames)
+        raw_chunks = compute_temporal_chunks(total_frames, temporal_chunk_frames, blend_frames=temporal_blend_frames)
+
+        # Validate and prune any empty/out-of-bounds chunks to guarantee every chunk has at least 1 valid token
+        valid_chunks = []
+        for chk in raw_chunks:
+            c_s = (chk.start_frame // 17) * 5
+            c_e = min(T_lat, ((chk.end_frame + 16) // 17) * 5) if chk.end_frame < total_frames else T_lat
+            if c_s < T_lat and c_e > c_s:
+                valid_chunks.append(chk)
+        if not valid_chunks:
+            from ..core.schemas import TemporalChunkDescriptor
+            valid_chunks = [TemporalChunkDescriptor(
+                chunk_idx=0,
+                start_frame=0,
+                end_frame=total_frames,
+                prefix_start_frame=0,
+                prefix_frame_count=0,
+                blend_frames=0
+            )]
+        temporal_chunks = valid_chunks
 
         # Construct spatial tile list: primary tiles + optional intersection-centered patches
         spatial_tiles = []
@@ -385,23 +423,39 @@ class H3LatentTiledKSampler:
             except Exception as e_bnd:
                 print(f"[H3LatentTiledKSampler] Reference bundle pre-encode notice: {e_bnd}")
 
+        # Prepare globally coherent canvas and audio noise for the entire video upfront on CPU.
+        # Slicing tile noise from this single coherent noise tensor guarantees:
+        # 1. Overlapping spatial tiles have 100% identical noise at their spatial boundaries.
+        # 2. Overlapping temporal chunks have 100% identical noise at their temporal transition frames.
+        # This completely eliminates phase-shift ghosting (e.g. double irises or cross-eyed faces at chunk seams).
+        base_seed = int(seed) if seed is not None else 0
+        if comfy is not None and hasattr(comfy, "sample") and hasattr(comfy.sample, "prepare_noise"):
+            full_canvas_noise = comfy.sample.prepare_noise(canvas_latent, base_seed)
+        else:
+            torch.manual_seed(base_seed)
+            full_canvas_noise = torch.randn_like(canvas_latent)
+
+        full_audio_noise = None
+        c_aud_base = input_audio_latent if input_audio_latent is not None else (latent_image.get("audio_samples") if isinstance(latent_image, dict) else None)
+        if isinstance(c_aud_base, torch.Tensor) and c_aud_base.ndim >= 4:
+            if comfy is not None and hasattr(comfy, "sample") and hasattr(comfy.sample, "prepare_noise"):
+                full_audio_noise = comfy.sample.prepare_noise(c_aud_base, base_seed)
+            else:
+                torch.manual_seed(base_seed)
+                full_audio_noise = torch.randn_like(c_aud_base)
+
         # 3. Outer Loop: Temporal Chunks (k = 0, 1, 2...)
-        for chunk in temporal_chunks:
-            k = chunk.chunk_idx
+        for chunk_idx, chunk in enumerate(temporal_chunks):
+            k = chunk_idx
             c_lat_start = (chunk.start_frame // 17) * 5
             c_lat_end = min(T_lat, ((chunk.end_frame + 16) // 17) * 5) if chunk.end_frame < total_frames else T_lat
+            if c_lat_start >= T_lat or c_lat_end <= c_lat_start:
+                print(f"[H3LatentTiledKSampler] Skipping empty temporal chunk {k+1}/{len(temporal_chunks)} (c_lat_start={c_lat_start}, c_lat_end={c_lat_end}, T_lat={T_lat})")
+                continue
 
-            # Prepare globally coherent canvas noise for temporal chunk k
-            # Deriving tile noise from this shared canvas ensures overlapping regions have 100% identical noise,
-            # eliminating motion tearing and tile seam divergence.
-            base_seed = int(seed) if seed is not None else 0
-            chunk_seed = (base_seed + k * 10007) & 0xffffffffffffffff
-            chunk_canvas_latent = canvas_latent[:, :, c_lat_start:c_lat_end]
-            if comfy is not None and hasattr(comfy, "sample") and hasattr(comfy.sample, "prepare_noise"):
-                global_chunk_noise = comfy.sample.prepare_noise(chunk_canvas_latent, chunk_seed)
-            else:
-                torch.manual_seed(chunk_seed)
-                global_chunk_noise = torch.randn_like(chunk_canvas_latent)
+            # Derive chunk noise from the coherent 5D canvas noise
+            chunk_seed = base_seed
+            global_chunk_noise = full_canvas_noise[:, :, c_lat_start:c_lat_end]
 
             base_prompt_text = ""
             if chunk_prompts:
@@ -631,41 +685,91 @@ class H3LatentTiledKSampler:
                 sampling_noise = tile_noise_crop
                 if is_av_model and comfy is not None and hasattr(comfy, "nested_tensor"):
                     c_tokens = c_lat_end - c_lat_start
-                    chunk_frames = (c_tokens - 1) * 4 + 1 if c_tokens > 1 else 1
-                    fps_val = 24.0
+                    chunk_frames = minimax_latents_to_frames(c_tokens)
                     duration = chunk_frames / fps_val
-                    audio_t = max(1, round(duration * 40))
+                    raw_audio_t = max(1, round(duration * 40))
+
+                    # MiniMax DiT RoPE grid assigns FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] per video token.
+                    # Over c_tokens, the video RoPE timeline advances by round(chunk_frames * 5 / 3) units.
+                    # Because audio RoPE advances by 1.0 unit per audio token, the DiT expects exactly
+                    # dit_audio_t = round(chunk_frames * 5 / 3) audio tokens to match the video temporal span.
+                    # If fps_val != 24.0, raw_audio_t != dit_audio_t.
+                    # Resampling the chunk's real-time audio tokens to dit_audio_t ensures 1-to-1 temporal
+                    # alignment between every video frame and spoken phoneme in the DiT's cross-attention.
+                    dit_audio_t = max(1, round(chunk_frames * (5.0 / 3.0)))
 
                     audio_latent = None
-                    if isinstance(latent_image, dict) and "audio_samples" in latent_image:
-                        c_aud = latent_image["audio_samples"]
+                    if tile_audio_mode == "mute_during_upscale":
+                        # Mute audio stream during tiled diffusion to prevent hallucinating lip-sync onto off-screen dialogue.
+                        # This preserves the input video's existing lips and facial movements perfectly.
+                        audio_latent = torch.zeros([tile_crop.shape[0], 32, 2, dit_audio_t], device=tile_crop.device, dtype=tile_crop.dtype)
+                    else:
+                        c_aud = input_audio_latent if input_audio_latent is not None else (latent_image.get("audio_samples") if isinstance(latent_image, dict) else None)
                         if isinstance(c_aud, torch.Tensor) and c_aud.ndim >= 4:
                             chunk_start_f = chunk.start_frame
                             a_start = max(0, round((chunk_start_f / fps_val) * 40))
-                            a_end = a_start + audio_t
+                            a_end = a_start + raw_audio_t
                             if a_end <= c_aud.shape[-1]:
-                                audio_latent = c_aud[:, :, :, a_start:a_end].clone()
+                                raw_chunk_aud = c_aud[:, :, :, a_start:a_end].clone()
                             else:
                                 a_slice = c_aud[:, :, :, a_start:]
-                                pad_amt = audio_t - a_slice.shape[-1]
-                                audio_latent = torch.nn.functional.pad(a_slice, (0, max(0, pad_amt)))
+                                pad_amt = raw_audio_t - a_slice.shape[-1]
+                                raw_chunk_aud = torch.nn.functional.pad(a_slice, (0, max(0, pad_amt)))
+
+                            if raw_chunk_aud.shape[-1] == dit_audio_t:
+                                audio_latent = raw_chunk_aud
+                            else:
+                                b_a, c_a, ch_a, t_a = raw_chunk_aud.shape
+                                flat_aud = raw_chunk_aud.reshape(b_a, c_a * ch_a, t_a).float()
+                                resampled_aud = torch.nn.functional.interpolate(flat_aud, size=dit_audio_t, mode="linear", align_corners=False)
+                                audio_latent = resampled_aud.reshape(b_a, c_a, ch_a, dit_audio_t).to(dtype=raw_chunk_aud.dtype)
 
                     if audio_latent is None:
-                        audio_latent = torch.zeros([tile_crop.shape[0], 32, 2, audio_t], device=tile_crop.device, dtype=tile_crop.dtype)
-                    elif audio_latent.shape[-1] != audio_t:
-                        if audio_latent.shape[-1] > audio_t:
-                            audio_latent = audio_latent[..., :audio_t]
+                        audio_latent = torch.zeros([tile_crop.shape[0], 32, 2, dit_audio_t], device=tile_crop.device, dtype=tile_crop.dtype)
+                    elif audio_latent.shape[-1] != dit_audio_t:
+                        if audio_latent.shape[-1] > dit_audio_t:
+                            audio_latent = audio_latent[..., :dit_audio_t]
                         else:
-                            pad_amt = audio_t - audio_latent.shape[-1]
+                            pad_amt = dit_audio_t - audio_latent.shape[-1]
                             audio_latent = torch.nn.functional.pad(audio_latent, (0, pad_amt))
                     audio_latent = audio_latent.to(device=tile_crop.device, dtype=tile_crop.dtype)
 
+                    # Coherent audio noise derived from full_audio_noise
+                    audio_noise = None
+                    if tile_audio_mode != "mute_during_upscale" and full_audio_noise is not None and isinstance(full_audio_noise, torch.Tensor) and full_audio_noise.ndim >= 4:
+                        if a_end <= full_audio_noise.shape[-1]:
+                            raw_chunk_noise = full_audio_noise[:, :, :, a_start:a_end].clone()
+                        else:
+                            a_n_slice = full_audio_noise[:, :, :, a_start:]
+                            pad_n = raw_audio_t - a_n_slice.shape[-1]
+                            raw_chunk_noise = torch.nn.functional.pad(a_n_slice, (0, max(0, pad_n)))
+
+                        if raw_chunk_noise.shape[-1] == dit_audio_t:
+                            audio_noise = raw_chunk_noise
+                        else:
+                            b_an, c_an, ch_an, t_an = raw_chunk_noise.shape
+                            flat_noise = raw_chunk_noise.reshape(b_an, c_an * ch_an, t_an).float()
+                            resampled_noise = torch.nn.functional.interpolate(flat_noise, size=dit_audio_t, mode="linear", align_corners=False)
+                            std = resampled_noise.std()
+                            if std > 1e-5:
+                                resampled_noise = resampled_noise / std
+                            audio_noise = resampled_noise.reshape(b_an, c_an, ch_an, dit_audio_t).to(dtype=raw_chunk_noise.dtype)
+
+                    if audio_noise is None:
+                        if comfy is not None and hasattr(comfy, "sample") and hasattr(comfy.sample, "prepare_noise"):
+                            audio_noise = comfy.sample.prepare_noise(audio_latent, base_seed + k)
+                        else:
+                            torch.manual_seed(base_seed + k)
+                            audio_noise = torch.randn_like(audio_latent)
+                    elif audio_noise.shape[-1] != dit_audio_t:
+                        if audio_noise.shape[-1] > dit_audio_t:
+                            audio_noise = audio_noise[..., :dit_audio_t]
+                        else:
+                            pad_n = dit_audio_t - audio_noise.shape[-1]
+                            audio_noise = torch.nn.functional.pad(audio_noise, (0, pad_n))
+                    audio_noise = audio_noise.to(device=tile_crop.device, dtype=tile_crop.dtype)
+
                     sampling_latent = comfy.nested_tensor.NestedTensor((tile_crop, audio_latent))
-                    if comfy is not None and hasattr(comfy, "sample") and hasattr(comfy.sample, "prepare_noise"):
-                        audio_noise = comfy.sample.prepare_noise(audio_latent, chunk_seed)
-                    else:
-                        torch.manual_seed(chunk_seed)
-                        audio_noise = torch.randn_like(audio_latent)
                     sampling_noise = comfy.nested_tensor.NestedTensor((tile_noise_crop, audio_noise))
 
                 # Offload CLIP and VAE from GPU before DiT sampling if requested (legacy non-precached mode)
@@ -708,7 +812,7 @@ class H3LatentTiledKSampler:
                         model, sampling_noise, cfg, sampler, sigmas, positive_cond, [], sampling_latent,
                         callback=tile_callback,
                         disable_pbar=True,
-                        seed=chunk_seed
+                        seed=base_seed
                     )
                     enhanced_tile = samples.unbind()[0] if getattr(samples, "is_nested", False) else samples
 
@@ -747,18 +851,18 @@ class H3LatentTiledKSampler:
                 chunk_tokens = c_lat_end - c_lat_start
                 temp_weight = torch.ones((1, 1, chunk_tokens, 1, 1), dtype=torch.float32)
 
-                # Seamless raised-cosine fade-in from chunk k-1
-                if k > 0:
-                    prev_chunk = temporal_chunks[k - 1]
+                # Seamless raised-cosine fade-in from chunk chunk_idx-1
+                if chunk_idx > 0:
+                    prev_chunk = temporal_chunks[chunk_idx - 1]
                     prev_c_lat_end = min(T_lat, ((prev_chunk.end_frame + 16) // 17) * 5) if prev_chunk.end_frame < total_frames else T_lat
                     head_blend_tokens = min(chunk_tokens // 2, max(0, prev_c_lat_end - c_lat_start))
                     if head_blend_tokens > 0:
                         fade_in = 0.5 - 0.5 * torch.cos(torch.linspace(0, torch.pi, head_blend_tokens))
                         temp_weight[:, :, :head_blend_tokens, :, :] = fade_in.view(1, 1, -1, 1, 1)
 
-                # Seamless raised-cosine fade-out into chunk k+1
-                if k < len(temporal_chunks) - 1:
-                    next_chunk = temporal_chunks[k + 1]
+                # Seamless raised-cosine fade-out into chunk chunk_idx+1
+                if chunk_idx < len(temporal_chunks) - 1:
+                    next_chunk = temporal_chunks[chunk_idx + 1]
                     next_c_lat_start = (next_chunk.start_frame // 17) * 5
                     tail_blend_tokens = min(chunk_tokens // 2, max(0, c_lat_end - next_c_lat_start))
                     if tail_blend_tokens > 0:
@@ -872,7 +976,7 @@ class H3LatentTiledKSampler:
             if debug_decode_chunks and vae is not None:
                 try:
                     chunk_lat = compute_normalized_canvas(c_lat_start, c_lat_end)
-                    export_debug_chunk_mp4(chunk_lat, k, debug_chunk_output_dir, vae, audio_vae, latent_image)
+                    export_debug_chunk_mp4(chunk_lat, k, debug_chunk_output_dir, vae, audio_vae, latent_image, fps=fps_val)
                 except Exception as e_dbg:
                     print(f"[H3LatentTiledKSampler] Debug export notice: {e_dbg}")
 

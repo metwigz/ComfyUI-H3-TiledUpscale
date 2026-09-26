@@ -18,7 +18,11 @@ try:
 except ImportError:
     pass
 
-from ..core.grid_utils import compute_temporal_chunks
+from ..core.grid_utils import (
+    compute_temporal_chunks,
+    minimax_latents_to_frames,
+    minimax_frames_to_latents
+)
 from ..core.vlm_engine import (
     extract_chunk_keyframes,
     caption_chunk_with_vlm,
@@ -152,13 +156,13 @@ class H3ChunkVideoDescriber:
 
         if video_lat is not None and hasattr(video_lat, "shape") and video_lat.ndim == 5:
             T_lat = video_lat.shape[2]
-            total_frames = (T_lat - 1) * 4 + 1 if T_lat > 1 else 1
+            total_frames = minimax_latents_to_frames(T_lat)
         elif frames is not None and hasattr(frames, "shape"):
             total_frames = frames.shape[0]
-            T_lat = (total_frames - 1) // 4 + 1
+            T_lat = minimax_frames_to_latents(total_frames)
         else:
             total_frames = max(1, temporal_chunk_frames if temporal_chunk_frames > 0 else 124)
-            T_lat = (total_frames - 1) // 4 + 1
+            T_lat = minimax_frames_to_latents(total_frames)
 
         fps = 24.0
         temporal_chunks = compute_temporal_chunks(

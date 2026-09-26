@@ -7,7 +7,8 @@ from ..core.grid_utils import (
     calculate_canvas_dimensions,
     calculate_optimal_tile_dimensions,
     compute_tile_intervals,
-    compute_temporal_chunks
+    compute_temporal_chunks,
+    minimax_latents_to_frames
 )
 from ..core.tensor_utils import unpack_latent
 
@@ -106,7 +107,7 @@ class H3TileCalculator:
                     # 5D latent [B, C, T, H/16, W/16]
                     _, _, t_lat, h_lat, w_lat = samples.shape
                     src_w, src_h = w_lat * 16, h_lat * 16
-                    total_frames = (t_lat - 1) * 4 + 1 if t_lat > 1 else 1
+                    total_frames = minimax_latents_to_frames(t_lat)
                     detected_source = f"Auto-detected from LATENT ({src_w}x{src_h}, {total_frames} frames)"
             except Exception:
                 pass

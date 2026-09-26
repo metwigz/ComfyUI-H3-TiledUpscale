@@ -131,7 +131,9 @@ def minimax_latents_to_frames(t_lat: int) -> int:
     """
     if t_lat <= 1:
         return 1
-    return max(1, (t_lat - 2) // 5 * 17 + 5)
+    if (t_lat - 2) % 5 == 0:
+        return max(1, (t_lat - 2) // 5 * 17 + 5)
+    return max(1, int(round((t_lat - 2) / 5.0 * 17.0)) + 5)
 
 def minimax_frames_to_latents(frames: int) -> int:
     """Converts video frame count to MiniMax H3 latent time tokens.
@@ -139,7 +141,9 @@ def minimax_frames_to_latents(frames: int) -> int:
     """
     if frames <= 1:
         return 1
-    return max(1, (frames - 5) // 17 * 5 + 2)
+    if (frames - 5) % 17 == 0:
+        return max(1, (frames - 5) // 17 * 5 + 2)
+    return max(1, int(round((frames - 5) / 17.0 * 5.0)) + 2)
 
 def compute_temporal_chunks(
     total_frames: int,

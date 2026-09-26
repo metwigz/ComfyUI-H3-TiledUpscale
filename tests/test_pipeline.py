@@ -404,6 +404,186 @@ def test_intersection_center_patches():
     print(f"  [OK] Center patches executed successfully: flat consensus preserved (max drift: {max_drift:.6f})")
 
 
+def test_multichunk_temporal_boundary():
+    print("[9/9] Testing Multi-Chunk Temporal Boundary & Non-Degenerate Slicing...")
+    # Exact scenario from user workflow: T_lat = 137, temporal_chunk_frames = 100, temporal_blend_frames = 17
+    T_lat = 137
+    sampler_node = H3LatentTiledKSampler()
+    class MockModel:
+        def __init__(self):
+            self.load_device = "cpu"
+            self.model_options = {}
+        def is_av_model(self):
+            return True
+        def get_model_object(self, name):
+            return None
+
+    # Synthetic latent with 137 frames
+    v_latent = torch.zeros((1, 24, T_lat, 16, 16), dtype=torch.float32)
+    a_latent = torch.zeros((1, 32, 2, 400), dtype=torch.float32)
+    latent_dict = {"samples": v_latent, "audio_samples": a_latent}
+
+    import comfy.sample
+    orig_sample_custom = comfy.sample.sample_custom
+    chunk_shapes = []
+    def recording_sample_custom(model, noise, cfg, sampler, sigmas, pos, neg, latent_image, **kwargs):
+        # latent_image can be NestedTensor
+        if hasattr(latent_image, "tensors"):
+            crop = latent_image.tensors[0]
+        elif hasattr(latent_image, "unbind"):
+            crop = latent_image.unbind()[0]
+        else:
+            crop = latent_image
+        chunk_shapes.append(crop.shape)
+        assert crop.shape[2] > 0, f"Encountered 0-element temporal latent: {crop.shape}"
+        return latent_image
+
+    comfy.sample.sample_custom = recording_sample_custom
+    try:
+        (sampled,) = sampler_node.sample_tiles(
+            model=MockModel(),
+            latent_image=latent_dict,
+            sampler="euler",
+            sigmas=[1.0, 0.0],
+            tile_megapixels=0.08,
+            overlap_percent=0.25,
+            tight_tile_overlap=True,
+            temporal_chunk_frames=100,
+            temporal_blend_frames=17,
+            tile_storage_strategy="in_memory"
+        )
+    finally:
+        comfy.sample.sample_custom = orig_sample_custom
+
+    assert "samples" in sampled
+    out_samples = sampled["samples"]
+    v_out = out_samples.unbind()[0] if hasattr(out_samples, "unbind") else out_samples
+    assert v_out.shape[2] == T_lat, f"Output latent time length mismatch: {v_out.shape[2]} vs {T_lat}"
+    print(f"  [OK] Multi-chunk sampling passed: {len(chunk_shapes)} tile jobs across temporal chunks, zero 0-element tensors (out: {v_out.shape})")
+
+
+def test_temporal_noise_coherence_and_audio_sync():
+    print("[10/10] Testing Temporal Noise Coherence Across Overlap Seams & Audio FPS Sync...")
+    T_lat = 55
+    sampler_node = H3LatentTiledKSampler()
+    class MockModel:
+        def __init__(self):
+            self.load_device = "cpu"
+            self.model_options = {}
+        def is_av_model(self):
+            return True
+        def get_model_object(self, name):
+            return None
+
+    v_latent = torch.randn((1, 24, T_lat, 16, 16), dtype=torch.float32)
+    # 500 audio tokens (longer than video duration)
+    a_latent = torch.randn((1, 32, 2, 500), dtype=torch.float32)
+    latent_dict = {"samples": v_latent, "audio_samples": a_latent}
+
+    import comfy.sample
+    orig_sample_custom = comfy.sample.sample_custom
+    recorded_noises = []
+    recorded_latents = []
+    recorded_audios = []
+
+    def recording_sample_custom(model, noise, cfg, sampler, sigmas, pos, neg, latent_image, **kwargs):
+        # Extract video noise and latent
+        v_n = noise.unbind()[0] if hasattr(noise, "unbind") else noise
+        v_l = latent_image.unbind()[0] if hasattr(latent_image, "unbind") else latent_image
+        recorded_noises.append(v_n.clone())
+        recorded_latents.append(v_l.clone())
+        if hasattr(latent_image, "unbind"):
+            parts = latent_image.unbind()
+            if len(parts) > 1:
+                recorded_audios.append(parts[1].clone())
+        return latent_image
+
+    comfy.sample.sample_custom = recording_sample_custom
+    try:
+        (sampled,) = sampler_node.sample_tiles(
+            model=MockModel(),
+            latent_image=latent_dict,
+            sampler="euler",
+            sigmas=[1.0, 0.0],
+            tile_megapixels=0.08,
+            overlap_percent=0.25,
+            tight_tile_overlap=True,
+            temporal_chunk_frames=100,
+            temporal_blend_frames=17,
+            tile_storage_strategy="in_memory",
+            fps=72.0,
+            seed=42,
+            tile_audio_mode="active_audio"
+        )
+    finally:
+        comfy.sample.sample_custom = orig_sample_custom
+
+    # Verify that in the temporal overlap interval between Chunk 0 and Chunk 1, the noise is 100% identical!
+    # Chunk 0 has tokens 0..30 (start 0, end 102 frames)
+    # Chunk 1 has tokens 25..55 (start 85, end 187 frames)
+    # Overlap tokens are 25..30
+    chunk0_noise = recorded_noises[0]
+    chunk1_noise = recorded_noises[1]
+
+    # In chunk0, overlap is at tokens 25:30 (slice [-5:])
+    # In chunk1, overlap is at tokens 0:5 (slice [:5])
+    c0_overlap_noise = chunk0_noise[:, :, 25:30]
+    c1_overlap_noise = chunk1_noise[:, :, :5]
+    max_noise_diff = torch.abs(c0_overlap_noise - c1_overlap_noise).max().item()
+    assert max_noise_diff == 0.0, f"Temporal overlap noise is not identical! Max diff: {max_noise_diff}"
+    print(f"  [OK] Temporal overlap noise is 100% identical between adjacent chunks (max diff: {max_noise_diff:.6f})")
+
+    # Verify that the audio latent provided to the DiT inside NestedTensor was resampled to match DiT RoPE span
+    assert len(recorded_audios) > 0, "No audio latents recorded during DiT sampling!"
+    chunk0_audio_tokens = recorded_audios[0].shape[-1]
+    # Chunk 0 has 30 video tokens -> minimax_latents_to_frames(30) frames -> round(frames * 5 / 3) RoPE tokens
+    chunk0_frames = core_grid.minimax_latents_to_frames(30)
+    expected_rope_tokens = round(chunk0_frames * (5.0 / 3.0))
+    assert chunk0_audio_tokens == expected_rope_tokens, f"DiT audio RoPE alignment mismatch: {chunk0_audio_tokens} vs expected {expected_rope_tokens}"
+    print(f"  [OK] Chunk audio latent resampled to match DiT RoPE grid: {chunk0_audio_tokens} tokens (for {chunk0_frames} frames)")
+
+    # Verify output audio preserves full audio latent losslessly
+    out_audio = sampled.get("audio_samples")
+    assert out_audio is not None, "Missing audio_samples in output latent"
+    assert out_audio.shape[-1] == a_latent.shape[-1], f"Audio latent duration mismatch: {out_audio.shape[-1]} vs original {a_latent.shape[-1]}"
+    print(f"  [OK] Output audio latent fully preserved losslessly ({out_audio.shape[-1]} tokens)")
+
+    # Verify tile_audio_mode="mute_during_upscale" produces zeroed audio latent to DiT but preserves output audio
+    muted_audios = []
+    def recording_muted_custom(model, noise, cfg, sampler, sigmas, pos, neg, latent_image, **kwargs):
+        if hasattr(latent_image, "unbind"):
+            parts = latent_image.unbind()
+            if len(parts) > 1:
+                muted_audios.append(parts[1].clone())
+        return latent_image
+
+    comfy.sample.sample_custom = recording_muted_custom
+    try:
+        (muted_sampled,) = sampler_node.sample_tiles(
+            model=MockModel(),
+            latent_image=latent_dict,
+            sampler="euler",
+            sigmas=[1.0, 0.0],
+            tile_megapixels=0.08,
+            overlap_percent=0.25,
+            tight_tile_overlap=True,
+            temporal_chunk_frames=100,
+            temporal_blend_frames=17,
+            tile_storage_strategy="in_memory",
+            fps=72.0,
+            seed=42,
+            tile_audio_mode="mute_during_upscale"
+        )
+    finally:
+        comfy.sample.sample_custom = orig_sample_custom
+
+    assert len(muted_audios) > 0, "No audio latents recorded for mute_during_upscale"
+    assert (muted_audios[0] == 0).all(), "tile_audio_mode='mute_during_upscale' did not pass zeroed audio to DiT!"
+    muted_out_audio = muted_sampled.get("audio_samples")
+    assert muted_out_audio is not None and not (muted_out_audio == 0).all(), "mute_during_upscale unexpectedly zeroed the output audio!"
+    print(f"  [OK] tile_audio_mode='mute_during_upscale' verified: DiT receives silent audio, output retains real audio")
+
+
 if __name__ == "__main__":
     print("\n" + "="*70)
     print(" Running ComfyUI-H3-TiledUpscale Standard-Type Test Harness")
@@ -416,6 +596,8 @@ if __name__ == "__main__":
     test_audio_vae_decode()
     test_multitile_seam_coherence()
     test_intersection_center_patches()
+    test_multichunk_temporal_boundary()
+    test_temporal_noise_coherence_and_audio_sync()
     print("\n" + "="*70)
     print(" ALL TESTS PASSED! 100% Standard ComfyUI Pipeline Operational.")
     print("="*70 + "\n")
