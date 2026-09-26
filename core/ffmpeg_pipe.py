@@ -6,53 +6,47 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
 def get_ffmpeg_binary() -> str:
-    """Finds ffmpeg across system PATH, imageio_ffmpeg, and portable directories."""
-    # 1. Check system PATH
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
+    """
+    Finds ffmpeg strictly within the ComfyUI Python environment or root.
+    NEVER queries or executes from the OS system PATH.
+    """
+    # 1. Explicit ComfyUI environment variable override
+    env_path = os.environ.get("COMFYUI_FFMPEG_PATH") or os.environ.get("VHS_FORCE_FFMPEG_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
 
-    # 2. Check imageio_ffmpeg
+    # 2. Check imageio_ffmpeg bundled inside ComfyUI Python's site-packages
     try:
         import imageio_ffmpeg
         exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe and os.path.exists(exe):
+        if exe and os.path.isfile(exe):
             return str(exe)
-    except ImportError:
+    except (ImportError, Exception):
         pass
 
-    # 3. Check ComfyUI root & python_embeded
+    # 3. Check local ComfyUI root and python_embeded directories only
     possible_roots = [
         Path(os.getcwd()),
         Path(os.getcwd()).parent,
-        Path(__file__).resolve().parents[3]  # ComfyUI base
+        Path(__file__).resolve().parents[3], # ComfyUI base
+        Path(__file__).resolve().parents[4], # Portable base
     ]
     for root in possible_roots:
-        candidate = root / "ffmpeg.exe"
-        if candidate.exists():
-            return str(candidate)
-        embed_candidate = root / "python_embeded" / "Scripts" / "ffmpeg.exe"
-        if embed_candidate.exists():
-            return str(embed_candidate)
+        candidates = [
+            root / "ffmpeg.exe",
+            root / "python_embeded" / "Scripts" / "ffmpeg.exe",
+            root / "python_embeded" / "ffmpeg.exe",
+            root / "custom_nodes" / "ComfyUI-DLSS5-Enhancer" / "ffmpeg" / "bin" / "ffmpeg.exe"
+        ]
+        for cand in candidates:
+            if cand.is_file():
+                return str(cand)
 
-    raise RuntimeError("FFmpeg executable not found. Please install imageio-ffmpeg or add ffmpeg to PATH.")
-
-def get_ffprobe_binary() -> Optional[str]:
-    """Finds ffprobe across system PATH, adjacent to ffmpeg, or imageio_ffmpeg."""
-    found = shutil.which("ffprobe")
-    if found:
-        return found
-    try:
-        ffmpeg_exe = Path(get_ffmpeg_binary())
-        probe_candidate = ffmpeg_exe.parent / (ffmpeg_exe.stem.replace("ffmpeg", "ffprobe") + ffmpeg_exe.suffix)
-        if probe_candidate.exists():
-            return str(probe_candidate)
-        probe_std = ffmpeg_exe.parent / "ffprobe.exe"
-        if probe_std.exists():
-            return str(probe_std)
-    except Exception:
-        pass
-    return None
+    raise RuntimeError(
+        "FFmpeg binary not found inside ComfyUI environment. "
+        "Please run: .\\python_embeded\\python.exe -m pip install imageio-ffmpeg "
+        "or place ffmpeg.exe in your ComfyUI root folder."
+    )
 
 def check_nvenc() -> bool:
     """Checks if FFmpeg has working h264_nvenc hardware acceleration."""
@@ -66,77 +60,31 @@ def check_nvenc() -> bool:
 def probe_video(video_path: str) -> Dict[str, Any]:
     """
     Probes video metadata (width, height, fps, total_frames, duration, has_audio)
-    using ffprobe if available, or fallback to ffmpeg decoding check.
+    using ComfyUI's native PyAV library (av). Never uses system PATH or external binaries.
     """
+    import av
     video_path = str(video_path)
-    ffprobe = get_ffprobe_binary()
-    if ffprobe:
-        try:
-            cmd = [
-                ffprobe, "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
-                "-show_entries", "format=duration",
-                "-of", "json",
-                video_path
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            data = json.loads(res.stdout)
-            stream = data["streams"][0]
-            w = int(stream["width"])
-            h = int(stream["height"])
-            r_fps = stream.get("r_frame_rate", "24/1")
-            if "/" in r_fps:
-                num, den = r_fps.split("/")
-                fps = float(num) / float(den) if float(den) != 0 else 24.0
-            else:
-                fps = float(r_fps)
-            
-            nb_frames = stream.get("nb_frames")
-            if nb_frames and nb_frames.isdigit() and int(nb_frames) > 0:
-                total_frames = int(nb_frames)
-            else:
-                dur = float(stream.get("duration") or data.get("format", {}).get("duration", 0.0))
-                total_frames = max(1, int(round(dur * fps)))
-
-            # Check audio stream
-            cmd_a = [
-                ffprobe, "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=index",
-                "-of", "json",
-                video_path
-            ]
-            res_a = subprocess.run(cmd_a, capture_output=True, text=True)
-            has_audio = len(json.loads(res_a.stdout).get("streams", [])) > 0
-
-            return {
-                "width": w,
-                "height": h,
-                "fps": fps,
-                "total_frames": total_frames,
-                "has_audio": has_audio
-            }
-        except Exception:
-            pass
-
-    # Fallback using OpenCV if ffprobe fails
-    import cv2
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video file: {video_path}")
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 24.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    return {
-        "width": w,
-        "height": h,
-        "fps": fps,
-        "total_frames": max(1, total_frames),
-        "has_audio": False
-    }
+    with av.open(video_path) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video streams found in: {video_path}")
+        v_stream = container.streams.video[0]
+        has_audio = len(container.streams.audio) > 0
+        w = int(v_stream.width)
+        h = int(v_stream.height)
+        rate = v_stream.average_rate or v_stream.base_rate
+        fps = float(rate) if rate else 24.0
+        total_frames = int(v_stream.frames or 0)
+        if total_frames <= 0 and container.duration:
+            duration_sec = float(container.duration / av.time_base)
+            total_frames = max(1, int(round(duration_sec * fps)))
+        return {
+            "width": w,
+            "height": h,
+            "fps": fps,
+            "total_frames": max(1, total_frames),
+            "duration": float(container.duration / av.time_base) if container.duration else 0.0,
+            "has_audio": has_audio
+        }
 
 def spawn_frame_reader(video_path: str, width: int, height: int, start_frame: int = 0, frame_count: Optional[int] = None):
     """

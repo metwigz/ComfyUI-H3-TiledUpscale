@@ -10,7 +10,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from typing import Optional, Dict, Any, Tuple
 
 try:
@@ -65,11 +64,12 @@ class AttnBlock3D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        q = rearrange(self.q(h), "b c t h w -> b 1 (t h w) c")
-        k = rearrange(self.k(h), "b c t h w -> b 1 (t h w) c")
-        v = rearrange(self.v(h), "b c t h w -> b 1 (t h w) c")
+        b, c, t, h_dim, w_dim = h.shape
+        q = self.q(h).permute(0, 2, 3, 4, 1).reshape(b, 1, t * h_dim * w_dim, c)
+        k = self.k(h).permute(0, 2, 3, 4, 1).reshape(b, 1, t * h_dim * w_dim, c)
+        v = self.v(h).permute(0, 2, 3, 4, 1).reshape(b, 1, t * h_dim * w_dim, c)
         h = F.scaled_dot_product_attention(q, k, v)
-        h = rearrange(h, "b 1 (t h w) c -> b c t h w", t=x.shape[2], h=x.shape[3], w=x.shape[4])
+        h = h.view(b, t, h_dim, w_dim, c).permute(0, 4, 1, 2, 3)
         return x + self.proj_out(h)
 
 class ResBlockEmb3D(nn.Module):

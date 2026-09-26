@@ -3,11 +3,16 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import torch
-import cv2
 
 def resolve_yolo_face_model():
     """Searches ComfyUI model directories for face detector, falling back to auto-cached yolov8n-face or yolov8n."""
-    from ultralytics import YOLO
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        raise RuntimeError(
+            "Face refinement requires 'ultralytics'. "
+            "To use this optional feature, run: .\\python_embeded\\python.exe -m pip install ultralytics"
+        )
     
     # Try ComfyUI folder_paths if available
     search_dirs = []
